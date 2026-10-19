@@ -72,7 +72,7 @@ jobs:
 
           Write-Host "Checking installer signature..."
 
-          $signature = Get-AuthenticodeSignature$installerPath
+          $signature = Get-AuthenticodeSignature -FilePath$installerPath
 
           if ($signature.Status -ne "Valid") {
             throw "The Tailscale installer signature is not valid."
