@@ -19,34 +19,34 @@ jobs:
       - name: Create RDP user
         timeout-minutes: 5
         env:
-          RDP_PASSWORD: \${{ secrets.RDP_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          \$ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace(\$env:RDP_PASSWORD)) {
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             throw "Create the RDP_PASSWORD repository secret first."
           }
 
           Write-Host "Creating the RDP user..."
 
-          \$securePass = ConvertTo-SecureString `
-            \$env:RDP_PASSWORD -AsPlainText -Force
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
 
           New-LocalUser `
             -Name "RDP" `
-            -Password \$securePass `
+            -Password $securePass `
             -AccountNeverExpires
 
           # Grant Remote Desktop access capability
           $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
           Add-LocalGroupMember `
-            -Group \$rdpGroup `
+            -Group $rdpGroup `
             -Member "RDP"
 
           # GRANT ADMINISTRATOR PRIVILEGES TO PREVENT PASSWORD PROMPTS
           $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
           Add-LocalGroupMember `
-            -Group \$adminGroup `
+            -Group $adminGroup `
             -Member "RDP"
 
           if (-not (Get-LocalUser -Name "RDP")) {
@@ -60,39 +60,27 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Finding the latest Tailscale Windows MSI..."
-
-          $packages = Invoke-RestMethod `
-            -Uri "https://tailscale.com" `
-            -TimeoutSec 60
-
-          $msiName = $packages.MSIs.amd64
-
-          if ([string]::IsNullOrWhiteSpace($msiName)) {
-            throw "Could not find the Tailscale Windows MSI."
-          }
-
           $installerPath = Join-Path $env:TEMP "tailscale.msi"
-          $downloadUrl = "https://tailscale.com"
+          $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
 
           Write-Host "Downloading Tailscale..."
 
           Invoke-WebRequest `
-            -Uri \$downloadUrl `
+            -Uri $downloadUrl `
             -OutFile $installerPath `
             -TimeoutSec 180
 
           Write-Host "Checking installer signature..."
 
-          signature = Get-AuthenticodeSignature installerPath
+          $signature = Get-AuthenticodeSignature$installerPath
 
-          if (\$signature.Status -ne "Valid") {
+          if ($signature.Status -ne "Valid") {
             throw "The Tailscale installer signature is not valid."
           }
 
           Write-Host "Installing Tailscale..."
 
-          \$process = Start-Process `
+          $process = Start-Process `
             -FilePath "msiexec.exe" `
             -ArgumentList "/i `"$installerPath`" /quiet /norestart" `
             -PassThru
@@ -122,39 +110,33 @@ jobs:
             throw "Create the TAILSCALE_AUTH_KEY repository secret first."
           }
 
-          $tailscale = Join-Path `
-            \$env:ProgramFiles "Tailscale\tailscale.exe"
-
-          \$hostname = "gh-runner-\(env:GITHUB_RUN_ID-\)env:GITHUB_RUN_ATTEMPT"
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          $hostname = "gh-runner-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
 
           Write-Host "Connecting to Tailscale..."
 
-          & \$tailscale up `
+          & $tailscale up `
             "--auth-key=$env:TS_AUTHKEY" `
-            "--hostname=\$hostname" `
+            "--hostname=$hostname" `
             --accept-routes=false `
             --timeout=120s
 
-          if (\$LASTEXITCODE -ne 0) {
+          if ($LASTEXITCODE -ne 0) {
             throw "Tailscale connection failed."
           }
 
-          tsIP = null
+          $tsIP = $null
 
-          for (\$attempt = 0; attempt -lt 20; attempt++) {
-            \(output = &\)tailscale ip -4
+          for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            $output = & $tailscale ip -4
 
-            if (LASTEXITCODE -eq 0 -and output) {
-              candidate = (output | Select-Object -First 1).Trim()
-              parsedIP = null
+            if ($LASTEXITCODE -eq 0 -and $output) {
+              $candidate = ($output | Select-Object -First 1).Trim()
+              $parsedIP = $null
 
-              if ([System.Net.IPAddress]::TryParse(
-                  \$candidate,
-                  [ref]\$parsedIP
-              )) {
-                if (\$parsedIP.AddressFamily -eq
-                    [System.Net.Sockets.AddressFamily]::InterNetwork) {
-                  tsIP = candidate
+              if ([System.Net.IPAddress]::TryParse($candidate, [ref]$parsedIP)) {
+                if ($parsedIP.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                  $tsIP = $candidate
                   break
                 }
               }
@@ -163,11 +145,11 @@ jobs:
             Start-Sleep -Seconds 3
           }
 
-          if (-not \$tsIP) {
+          if (-not $tsIP) {
             throw "Tailscale did not assign an IPv4 address."
           }
 
-          "TAILSCALE_IP=\$tsIP" |
+          "TAILSCALE_IP=$tsIP" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
               -Encoding utf8 `
@@ -186,7 +168,7 @@ jobs:
           Write-Host "Enabling Remote Desktop..."
 
           Set-ItemProperty `
-            -Path \$terminalServer `
+            -Path $terminalServer `
             -Name "fDenyTSConnections" `
             -Value 0
 
@@ -198,7 +180,7 @@ jobs:
             -Value 1
 
           Set-ItemProperty `
-            -Path \$rdpTcp `
+            -Path $rdpTcp `
             -Name "SecurityLayer" `
             -Value 1
 
@@ -258,7 +240,7 @@ jobs:
         timeout-minutes: 5
         run: |
           $ErrorActionPreference = "Stop"
-          $ready = $false
+          $ready =$false
 
           for ($attempt = 1; $attempt -le 12; $attempt++) {
             Write-Host "Checking RDP listener: attempt $attempt of 12..."
@@ -266,13 +248,12 @@ jobs:
             $client = [System.Net.Sockets.TcpClient]::new()
 
             try {
-              $connectTask = $client.ConnectAsync(
-                $env:TAILSCALE_IP,
+              $connectTask = $client.ConnectAsync($env:TAILSCALE_IP,
                 3389
               )
 
-              if ($connectTask.Wait(5000) -and $client.Connected) {
-                $ready = $true
+              if ($connectTask.Wait(5000) -and$client.Connected) {
+                $ready =$true
               }
             }
             catch {
@@ -322,14 +303,13 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 2
         run: |
-          $tailscale = Join-Path `
-            \$env:ProgramFiles "Tailscale\tailscale.exe"
+          $tailscale = Join-Path$env:ProgramFiles "Tailscale\tailscale.exe"
 
-          if (Test-Path \$tailscale) {
+          if (Test-Path $tailscale) {
             Write-Host "Disconnecting Tailscale..."
-            & \$tailscale logout
+            & $tailscale logout
 
-            if (\$LASTEXITCODE -ne 0) {
+            if ($LASTEXITCODE -ne 0) {
               Write-Warning "Tailscale logout did not complete successfully."
               exit 0
             }
