@@ -1,9 +1,66 @@
-- name: Install Tailscale
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Create RDP user
+        timeout-minutes: 5
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Create the RDP_PASSWORD repository secret first."
+          }
+
+          Write-Host "Creating the RDP user..."
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires
+
+          # Grant Remote Desktop access capability
+          $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
+          Add-LocalGroupMember `
+            -Group $rdpGroup `
+            -Member "RDP"
+
+          # GRANT ADMINISTRATOR PRIVILEGES TO PREVENT PASSWORD PROMPTS
+          $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
+          Add-LocalGroupMember `
+            -Group $adminGroup `
+            -Member "RDP"
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+            throw "User creation failed."
+          }
+
+          Write-Host "RDP user created successfully with Admin rights."
+
+      - name: Install Tailscale
         timeout-minutes: 10
         run: |
           $ErrorActionPreference = "Stop"
 
-          $installerPath = Join-Path$env:TEMP "tailscale.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
           $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
 
           Write-Host "Downloading Tailscale..."
@@ -15,7 +72,7 @@
 
           Write-Host "Checking installer signature..."
 
-          $signature = Get-AuthenticodeSignature $installerPath
+          $signature = Get-AuthenticodeSignature$installerPath
 
           if ($signature.Status -ne "Valid") {
             throw "The Tailscale installer signature is not valid."
@@ -41,3 +98,219 @@
           Start-Service -Name "Tailscale"
 
           Write-Host "Tailscale installed successfully."
+
+      - name: Connect to Tailscale
+        timeout-minutes: 5
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Create the TAILSCALE_AUTH_KEY repository secret first."
+          }
+
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          $hostname = "gh-runner-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
+
+          Write-Host "Connecting to Tailscale..."
+
+          & $tailscale up `
+            "--auth-key=$env:TS_AUTHKEY" `
+            "--hostname=$hostname" `
+            --accept-routes=false `
+            --timeout=120s
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $tsIP = $null
+
+          for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            $output = & $tailscale ip -4
+
+            if ($LASTEXITCODE -eq 0 -and $output) {
+              $candidate = ($output | Select-Object -First 1).Trim()
+              $parsedIP = $null
+
+              if ([System.Net.IPAddress]::TryParse($candidate, [ref]$parsedIP)) {
+                if ($parsedIP.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                  $tsIP = $candidate
+                  break
+                }
+              }
+            }
+
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $tsIP) {
+            throw "Tailscale did not assign an IPv4 address."
+          }
+
+          "TAILSCALE_IP=$tsIP" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "Tailscale connected: $tsIP"
+
+      - name: Configure RDP securely
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $terminalServer = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $rdpTcp = "$terminalServer\WinStations\RDP-Tcp"
+
+          Write-Host "Enabling Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path $terminalServer `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Write-Host "Enabling Network Level Authentication..."
+
+          Set-ItemProperty `
+            -Path $rdpTcp `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Set-ItemProperty `
+            -Path $rdpTcp `
+            -Name "SecurityLayer" `
+            -Value 1
+
+          Write-Host "Disabling built-in RDP firewall rules..."
+
+          Get-NetFirewallRule `
+            -Name "RemoteDesktop*" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Write-Host "Removing any previous custom RDP rule..."
+
+          Get-NetFirewallRule `
+            -Name "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          Write-Host "Allowing RDP on the Tailscale IPv4 address..."
+
+          New-NetFirewallRule `
+            -Name "RDP-Tailscale" `
+            -DisplayName "RDP over Tailscale" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -LocalAddress $env:TAILSCALE_IP `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any |
+            Out-Null
+
+          Write-Host "Setting RDP service startup..."
+
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          $service = Get-Service -Name "TermService"
+
+          Write-Host "RDP service status: $($service.Status)"
+
+          if ($service.Status -eq "Stopped") {
+            Write-Host "Starting RDP service..."
+            Start-Service -Name "TermService"
+          }
+
+          $service = Get-Service -Name "TermService"
+
+          $service.WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(60)
+          )
+
+          Write-Host "RDP configuration finished."
+
+      - name: Verify local RDP listener
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ready =$false
+
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Write-Host "Checking RDP listener: attempt $attempt of 12..."
+
+            $client = [System.Net.Sockets.TcpClient]::new()
+
+            try {
+              $connectTask = $client.ConnectAsync($env:TAILSCALE_IP,
+                3389
+              )
+
+              if ($connectTask.Wait(5000) -and$client.Connected) {
+                $ready =$true
+              }
+            }
+            catch {
+              Write-Host "RDP is not ready yet."
+            }
+            finally {
+              $client.Dispose()
+            }
+
+            if ($ready) {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ready) {
+            Get-Service -Name "TermService" |
+              Format-Table -AutoSize
+
+            throw "The local RDP listener did not become ready."
+          }
+
+          Write-Host "Local RDP listener is ready."
+          Write-Host "Remote access also depends on your Tailscale access rules."
+
+      - name: Keep session available
+        timeout-minutes: 310
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:COMPUTERNAME\RDP"
+          Write-Host "Password: Use your RDP_PASSWORD secret."
+          Write-Host "Cancel this workflow run to stop the session."
+          Write-Host "=================="
+          Write-Host ""
+
+          $deadline = (Get-Date).AddHours(5)
+
+          while ((Get-Date) -lt $deadline) {
+            Write-Host "[$(Get-Date -Format o)] Session available."
+            Start-Sleep -Seconds 300
+          }
+
+      - name: Disconnect Tailscale
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          $tailscale = Join-Path$env:ProgramFiles "Tailscale\tailscale.exe"
+
+          if (Test-Path $tailscale) {
+            Write-Host "Disconnecting Tailscale..."
+            & $tailscale logout
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Tailscale logout did not complete successfully."
+              exit 0
+            }
+          }
